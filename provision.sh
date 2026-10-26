@@ -23,6 +23,9 @@ if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
   exit 1
 fi
 
+# prepara a pasta de trabalho dos ambientes no disco da vm
+mkdir -p /var/lib/cloud-execution-manager
+
 # esta pagina serve para conferir o acesso ao servidor web
 cat > /var/www/html/index.html <<'HTML'
 <!DOCTYPE html>

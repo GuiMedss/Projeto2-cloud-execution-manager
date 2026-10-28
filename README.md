@@ -2,13 +2,14 @@
 
 Projeto de Computacao em Nuvem para gerenciar ambientes de execucao pela web, usando namespaces e cgroups.
 
-O projeto conta com o provisionamento da VM e a criacao de ambientes com namespaces e limites de CPU, memoria e I/O. A interface web, o banco da aplicacao e a execucao de programas enviados pelo usuario estao em desenvolvimento.
+O projeto conta com o provisionamento da VM, a criacao de ambientes com namespaces e limites de CPU, memoria e I/O e a aplicacao web com banco MySQL, upload de scripts e controle dos ambientes. A execucao dos programas enviados pelo usuario esta em desenvolvimento.
 
 ## Arquivos
 
 - `Vagrantfile`: define a VM, os recursos e a porta de acesso.
 - `provision.sh`: instala os pacotes, clona o repositorio e inicia os servicos.
 - `ambientes.py`: cria ambientes isolados e aplica os limites de recursos.
+- `app/`: aplicacao web em Node.js (`servidor.js`, `banco.js`, `execucao.js`, `schema.sql`).
 - `.gitattributes`: mantem os scripts com finais de linha compativeis com Linux, mesmo no Windows.
 - `.gitignore`: impede que os arquivos locais do Vagrant sejam enviados ao GitHub.
 
@@ -42,7 +43,7 @@ Depois, abra no navegador:
 http://localhost:8080
 ```
 
-A pagina deve mostrar que a VM e o Apache estao funcionando. Essa pagina e temporaria e ainda nao executa programas.
+A pagina deve mostrar que a VM e o Apache estao funcionando. Essa pagina e temporaria. A aplicacao web fica em `http://localhost:3000`.
 
 O codigo e clonado do GitHub em `/opt/cloud-execution-manager`. A pasta do computador nao e compartilhada com a VM.
 
@@ -188,4 +189,62 @@ As pastas de trabalho ficam preservadas. A consulta de status e os comandos de e
 
 A funcao `criar_ambiente(nome, cpu, memoria, io)` concentra a criacao e retorna um dicionario. A aplicacao tambem podera chamar a linha de comando com uma lista de argumentos e interpretar o JSON retornado. Os numeros devem ser inteiros, nas unidades da tabela; os campos de retorno sao `nome`, `unidade`, `pasta`, `cgroup`, `cpu`, `memoria` e `io`.
 
-A criacao de ambientes requer `sudo` dentro da VM. A permissao para chamadas pela aplicacao web ainda depende da integracao. O Apache nao possui acesso geral de sudo.
+A criacao de ambientes requer `sudo` dentro da VM. A aplicacao web chama o script pelo usuario `cloudapp`, que tem permissao de sudo apenas para o `ambientes.py` (veja a secao Aplicacao web). O Apache nao possui acesso geral de sudo.
+
+## Aplicacao web
+
+A aplicacao usa Node.js 20, Express, `mysql2` e `multer`. O provisionamento instala tudo, cria o banco, as tabelas e o usuario do MySQL, e inicia o servico `cloud-app`, executado pelo usuario `cloudapp`. Depois do `vagrant up`, basta abrir:
+
+```text
+http://localhost:3000
+```
+
+A senha do usuario do MySQL e gerada no primeiro provisionamento e fica em `/etc/cloud-execution-manager.env`, fora do repositorio.
+
+### Paginas
+
+- `Ambientes` (`/`): formulario de criacao (nome, CPU, memoria, I/O e um script ja enviado ou um comando), botao de atualizar o status e tabela com os ambientes. Cada linha tem os botoes de ver a saida, encerrar e remover.
+- `Scripts` (`/scripts`): envio de arquivos `.py` ou `.sh` de ate 1 MB e lista dos scripts enviados. O link "usar em novo ambiente" abre o formulario de criacao com o script selecionado.
+- Saida (`/ambientes/<id>/saida`): mostra os ultimos 64 KB do arquivo de saida e pode ser atualizada enquanto o servico continua rodando.
+
+### Banco e arquivos
+
+O banco `cloud_execution_manager` tem duas tabelas, criadas por `app/schema.sql`:
+
+- `scripts`: `nome` original, `caminho` do arquivo no disco e `tamanho`. Os arquivos ficam em `/var/lib/cloud-scripts` e podem ser usados em varios ambientes.
+- `ambientes`: `nome`, `cpu`, `memoria`, `io`, `script_id` ou `comando`, `estado` (`em_execucao`, `terminado` ou `erro`), `unidade`, `pasta`, `cgroup`, `saida` e `mensagem`. Esses campos guardam o que a execucao retorna ao criar e consultar.
+
+O estado salvo so muda quando alguem clica em atualizar, abre a saida, encerra ou remove o ambiente. Ao remover com sucesso, o registro do ambiente e apagado.
+
+### Contrato com a execucao
+
+O ambiente e identificado pelo `nome`, que e unico. Unidades: `cpu` em porcentagem de um nucleo (1 a 100), `memoria` em MiB (32 a 2048) e `io` em MiB/s (1 a 100), as mesmas do `ambientes.py`. A aplicacao valida esses campos antes de chamar a execucao.
+
+O arquivo `app/execucao.js` chama `sudo -n /usr/bin/python3 /opt/cloud-execution-manager/ambientes.py` com os argumentos abaixo, sem shell. O stdout deve ser um JSON. Em caso de erro, o programa sai com codigo 1 e escreve `erro: mensagem` no stderr; a aplicacao mostra essa mensagem.
+
+| Acao | Chamada | Retorno |
+| --- | --- | --- |
+| criar | `criar NOME --cpu=N --memoria=N --io=N --script=CAMINHO` ou `--comando=TEXTO` | `nome`, `unidade`, `pasta`, `cgroup`, `saida`, `cpu`, `memoria`, `io` |
+| consultar | `status NOME` | `nome`, `estado` (`em_execucao`, `terminado` ou `erro`), `saida`, `mensagem` (opcional) |
+| encerrar | `encerrar NOME` | `nome`, `estado` |
+| remover | `remover NOME` | `nome`, `removido` |
+
+Combinados que a aplicacao assume:
+
+- `saida` e o caminho do arquivo onde o ambiente grava a saida, legivel pelo usuario `cloudapp`.
+- `script` e o caminho de um `.py` ou `.sh` em `/var/lib/cloud-scripts`; a execucao escolhe o interpretador pela extensao.
+- `remover` tambem encerra o ambiente se ele ainda estiver rodando, limpa os recursos e nao falha se o ambiente ja nao existir.
+- O `sudoers` criado no provisionamento so permite que `cloudapp` execute esse `ambientes.py`, com qualquer argumento.
+
+### Como verificar
+
+Dentro da VM:
+
+```bash
+systemctl is-active cloud-app
+sudo journalctl -u cloud-app -n 20
+sudo mysql -e "SELECT id, nome, estado FROM cloud_execution_manager.ambientes;"
+ls -l /var/lib/cloud-scripts
+```
+
+Fluxo de teste pela interface: enviar um script, criar dois ambientes (um usando o script e outro com um comando), clicar em atualizar, abrir a saida de um servico que continua rodando, encerrar um ambiente e remover os dois.

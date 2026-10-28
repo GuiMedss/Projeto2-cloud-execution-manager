@@ -73,6 +73,11 @@ mysql -e "CREATE USER IF NOT EXISTS 'cloudapp'@'localhost' IDENTIFIED BY '$SENHA
 ALTER USER 'cloudapp'@'localhost' IDENTIFIED BY '$SENHA_DB';
 GRANT ALL ON cloud_execution_manager.* TO 'cloudapp'@'localhost';"
 
+# a aplicacao so pode chamar o ambientes.py com sudo, sem senha
+echo "cloudapp ALL=(root) NOPASSWD: /usr/bin/python3 $PASTA_PROJETO/ambientes.py *" > /etc/sudoers.d/cloudapp
+chmod 440 /etc/sudoers.d/cloudapp
+visudo -cf /etc/sudoers.d/cloudapp
+
 # servico systemd da aplicacao web
 cat > /etc/systemd/system/cloud-app.service <<'UNIT'
 [Unit]

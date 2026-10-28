@@ -54,6 +54,21 @@ id cloudapp >/dev/null 2>&1 || useradd --system --home-dir "$PASTA_PROJETO" --sh
 # instala as dependencias da aplicacao
 (cd "$PASTA_PROJETO/app" && npm ci --omit=dev --no-audit --no-fund)
 
+# senha do banco gerada uma vez e guardada fora do repositorio
+ARQUIVO_ENV="/etc/cloud-execution-manager.env"
+if [ ! -f "$ARQUIVO_ENV" ]; then
+  echo "DB_SENHA=$(openssl rand -hex 16)" > "$ARQUIVO_ENV"
+  chmod 600 "$ARQUIVO_ENV"
+fi
+SENHA_DB=$(grep '^DB_SENHA=' "$ARQUIVO_ENV" | cut -d= -f2)
+
+# cria o banco, as tabelas e o usuario da aplicacao
+systemctl enable --now mysql
+mysql < "$PASTA_PROJETO/app/schema.sql"
+mysql -e "CREATE USER IF NOT EXISTS 'cloudapp'@'localhost' IDENTIFIED BY '$SENHA_DB';
+ALTER USER 'cloudapp'@'localhost' IDENTIFIED BY '$SENHA_DB';
+GRANT ALL ON cloud_execution_manager.* TO 'cloudapp'@'localhost';"
+
 # servico systemd da aplicacao web
 cat > /etc/systemd/system/cloud-app.service <<'UNIT'
 [Unit]
@@ -62,6 +77,7 @@ After=network.target mysql.service
 
 [Service]
 User=cloudapp
+EnvironmentFile=/etc/cloud-execution-manager.env
 WorkingDirectory=/opt/cloud-execution-manager/app
 ExecStart=/usr/bin/node servidor.js
 Restart=on-failure

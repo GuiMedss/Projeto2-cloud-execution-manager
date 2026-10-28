@@ -54,6 +54,10 @@ id cloudapp >/dev/null 2>&1 || useradd --system --home-dir "$PASTA_PROJETO" --sh
 # instala as dependencias da aplicacao
 (cd "$PASTA_PROJETO/app" && npm ci --omit=dev --no-audit --no-fund)
 
+# pasta dos scripts enviados pela aplicacao, no disco da vm
+mkdir -p /var/lib/cloud-scripts
+chown cloudapp:cloudapp /var/lib/cloud-scripts
+
 # senha do banco gerada uma vez e guardada fora do repositorio
 ARQUIVO_ENV="/etc/cloud-execution-manager.env"
 if [ ! -f "$ARQUIVO_ENV" ]; then

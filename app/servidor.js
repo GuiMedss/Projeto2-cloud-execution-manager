@@ -1,8 +1,12 @@
 const express = require("express");
+const fs = require("fs");
+const multer = require("multer");
+const path = require("path");
 const { consultar } = require("./banco");
 const execucao = require("./execucao");
 
 const PORTA = process.env.PORTA || 3000;
+const PASTA_SCRIPTS = process.env.SCRIPTS_DIR || "/var/lib/cloud-scripts";
 const ESTADOS = { em_execucao: "em execucao", terminado: "terminado", erro: "erro" };
 
 // escapa texto antes de colocar no html
@@ -65,7 +69,7 @@ function validar(corpo) {
 
 function formularioAmbiente(valores, scripts) {
   const opcoes = scripts.map((s) =>
-    `<option value="${s.id}"${String(valores.script_id) === String(s.id) ? " selected" : ""}>${esc(s.nome)}</option>`);
+    `<option value="${s.id}"${String(valores.script_id) === String(s.id) ? " selected" : ""}>${esc(s.nome)} (#${s.id})</option>`);
   return `<form method="post" action="/ambientes">
     <label>Nome <input name="nome" value="${esc(valores.nome)}" maxlength="30" required></label>
     <label>CPU (% de um nucleo, 1 a 100) <input name="cpu" type="number" min="1" max="100" value="${esc(valores.cpu)}" required></label>
@@ -111,7 +115,7 @@ app.use(express.urlencoded({ extended: false }));
 
 app.get("/", async (req, res, next) => {
   try {
-    res.send(await paginaAmbientes({ msg: req.query.msg }));
+    res.send(await paginaAmbientes({ msg: req.query.msg, valores: { script_id: req.query.script } }));
   } catch (erro) { next(erro); }
 });
 
@@ -147,8 +151,65 @@ app.post("/ambientes", async (req, res, next) => {
   } catch (erro) { next(erro); }
 });
 
-app.get("/scripts", (req, res) => {
-  res.send(pagina("Scripts", "<h2>Scripts</h2><p>Nenhum script ainda.</p>"));
+// guarda o arquivo enviado no disco da vm com um nome unico
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: PASTA_SCRIPTS,
+    filename: (req, arquivo, cb) => cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${path.extname(arquivo.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: 1024 * 1024 },
+  fileFilter: (req, arquivo, cb) => {
+    const ok = [".py", ".sh"].includes(path.extname(arquivo.originalname).toLowerCase());
+    cb(ok ? null : new Error("envie um arquivo .py ou .sh"), ok);
+  },
+});
+
+async function paginaScripts({ erros = [], msg = "" } = {}) {
+  const scripts = await consultar("SELECT id, nome, caminho, tamanho, criado_em FROM scripts ORDER BY id DESC");
+  const avisos = erros.map((e) => `<p class="erro">${esc(e)}</p>`).join("")
+    + (msg ? `<p class="ok">${esc(msg)}</p>` : "");
+  const linhas = scripts.map((s) => `<tr>
+      <td>${s.id}</td>
+      <td>${esc(s.nome)}</td>
+      <td>${s.tamanho} bytes</td>
+      <td>${esc(new Date(s.criado_em).toLocaleString("pt-BR"))}</td>
+      <td><a href="/?script=${s.id}">usar em novo ambiente</a></td>
+    </tr>`);
+  const tabela = scripts.length
+    ? `<table><tr><th>Id</th><th>Nome</th><th>Tamanho</th><th>Enviado em</th><th></th></tr>${linhas.join("")}</table>`
+    : "<p>Nenhum script ainda.</p>";
+  return pagina("Scripts", `<h2>Enviar script</h2>${avisos}
+    <form method="post" action="/scripts" enctype="multipart/form-data">
+      <label>Arquivo (.py ou .sh, ate 1 MB) <input type="file" name="arquivo" accept=".py,.sh" required></label>
+      <button>Enviar</button>
+    </form>
+    <h2>Scripts enviados</h2>${tabela}`);
+}
+
+app.get("/scripts", async (req, res, next) => {
+  try {
+    res.send(await paginaScripts({ msg: req.query.msg }));
+  } catch (erro) { next(erro); }
+});
+
+app.post("/scripts", (req, res, next) => {
+  upload.single("arquivo")(req, res, async (erroUpload) => {
+    try {
+      if (erroUpload || !req.file) {
+        const msg = erroUpload ? (erroUpload.code === "LIMIT_FILE_SIZE" ? "arquivo maior que 1 MB" : erroUpload.message) : "nenhum arquivo enviado";
+        return res.status(400).send(await paginaScripts({ erros: [msg] }));
+      }
+      const nome = path.basename(req.file.originalname).slice(0, 100);
+      try {
+        await consultar("INSERT INTO scripts (nome, caminho, tamanho) VALUES (?, ?, ?)",
+          [nome, req.file.path, req.file.size]);
+      } catch (erro) {
+        fs.unlink(req.file.path, () => {});
+        throw erro;
+      }
+      res.redirect(`/scripts?msg=${encodeURIComponent(`script ${nome} enviado`)}`);
+    } catch (erro) { next(erro); }
+  });
 });
 
 app.use((erro, req, res, next) => {

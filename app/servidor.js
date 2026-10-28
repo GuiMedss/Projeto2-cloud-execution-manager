@@ -91,10 +91,15 @@ function tabelaAmbientes(ambientes) {
       <td>${a.memoria} MiB</td>
       <td>${a.io} MiB/s</td>
       <td>${esc(a.script_nome || a.comando)}</td>
-      <td>${ESTADOS[a.estado]}</td>
+      <td>${ESTADOS[a.estado]}${a.mensagem ? `<br><small>${esc(a.mensagem)}</small>` : ""}</td>
+      <td>
+        <a href="/ambientes/${a.id}/saida">saida</a>
+        ${a.estado === "em_execucao" ? `<form method="post" action="/ambientes/${a.id}/encerrar" style="display:inline"><button>Encerrar</button></form>` : ""}
+        <form method="post" action="/ambientes/${a.id}/remover" style="display:inline" onsubmit="return confirm('remover o ambiente?')"><button>Remover</button></form>
+      </td>
     </tr>`);
   return `<table>
-    <tr><th>Nome</th><th>CPU</th><th>Memoria</th><th>I/O</th><th>Programa</th><th>Estado</th></tr>
+    <tr><th>Nome</th><th>CPU</th><th>Memoria</th><th>I/O</th><th>Programa</th><th>Estado</th><th>Acoes</th></tr>
     ${linhas.join("")}
   </table>`;
 }
@@ -107,7 +112,9 @@ async function paginaAmbientes({ valores = {}, erros = [], msg = "" } = {}) {
   const avisos = erros.map((e) => `<p class="erro">${esc(e)}</p>`).join("")
     + (msg ? `<p class="ok">${esc(msg)}</p>` : "");
   return pagina("Ambientes", `<h2>Novo ambiente</h2>${avisos}${formularioAmbiente(valores, scripts)}
-    <h2>Ambientes</h2>${tabelaAmbientes(ambientes)}`);
+    <h2>Ambientes</h2>
+    <form method="post" action="/atualizar"><button>Atualizar status</button></form>
+    ${tabelaAmbientes(ambientes)}`);
 }
 
 const app = express();
@@ -115,7 +122,11 @@ app.use(express.urlencoded({ extended: false }));
 
 app.get("/", async (req, res, next) => {
   try {
-    res.send(await paginaAmbientes({ msg: req.query.msg, valores: { script_id: req.query.script } }));
+    res.send(await paginaAmbientes({
+      msg: req.query.msg,
+      erros: req.query.erro ? [req.query.erro] : [],
+      valores: { script_id: req.query.script },
+    }));
   } catch (erro) { next(erro); }
 });
 
@@ -148,6 +159,92 @@ app.post("/ambientes", async (req, res, next) => {
       }
     }
     res.status(400).send(await paginaAmbientes({ valores: req.body, erros }));
+  } catch (erro) { next(erro); }
+});
+
+// consulta o estado na execucao e grava no banco
+async function atualizarEstado(ambiente) {
+  let estado;
+  let mensagem;
+  try {
+    const r = await execucao.status(ambiente.nome);
+    estado = ESTADOS[r.estado] ? r.estado : "erro";
+    mensagem = r.mensagem || null;
+  } catch (erro) {
+    estado = "erro";
+    mensagem = erro.message;
+  }
+  await consultar("UPDATE ambientes SET estado = ?, mensagem = ? WHERE id = ?", [estado, mensagem, ambiente.id]);
+  return { ...ambiente, estado, mensagem };
+}
+
+const avisar = (res, tipo, texto) => res.redirect(`/?${tipo}=${encodeURIComponent(texto)}`);
+
+app.post("/atualizar", async (req, res, next) => {
+  try {
+    const ativos = await consultar("SELECT * FROM ambientes WHERE estado = 'em_execucao'");
+    for (const ambiente of ativos) await atualizarEstado(ambiente);
+    avisar(res, "msg", "status atualizado");
+  } catch (erro) { next(erro); }
+});
+
+app.post("/ambientes/:id/encerrar", async (req, res, next) => {
+  try {
+    const [ambiente] = await consultar("SELECT * FROM ambientes WHERE id = ?", [Number(req.params.id)]);
+    if (!ambiente) return avisar(res, "erro", "ambiente nao encontrado");
+    try {
+      const r = await execucao.encerrar(ambiente.nome);
+      const estado = ESTADOS[r.estado] ? r.estado : "terminado";
+      await consultar("UPDATE ambientes SET estado = ?, mensagem = NULL WHERE id = ?", [estado, ambiente.id]);
+      avisar(res, "msg", `ambiente ${ambiente.nome} encerrado`);
+    } catch (erro) {
+      avisar(res, "erro", `nao foi possivel encerrar ${ambiente.nome}: ${erro.message}`);
+    }
+  } catch (erro) { next(erro); }
+});
+
+app.post("/ambientes/:id/remover", async (req, res, next) => {
+  try {
+    const [ambiente] = await consultar("SELECT * FROM ambientes WHERE id = ?", [Number(req.params.id)]);
+    if (!ambiente) return avisar(res, "erro", "ambiente nao encontrado");
+    try {
+      await execucao.remover(ambiente.nome);
+      await consultar("DELETE FROM ambientes WHERE id = ?", [ambiente.id]);
+      avisar(res, "msg", `ambiente ${ambiente.nome} removido`);
+    } catch (erro) {
+      avisar(res, "erro", `nao foi possivel remover ${ambiente.nome}: ${erro.message}`);
+    }
+  } catch (erro) { next(erro); }
+});
+
+// le o final do arquivo de saida, mesmo com o servico ainda escrevendo
+async function lerFinal(caminho, limite = 64 * 1024) {
+  const arquivo = await fs.promises.open(caminho, "r");
+  try {
+    const { size } = await arquivo.stat();
+    const inicio = Math.max(0, size - limite);
+    const buffer = Buffer.alloc(size - inicio);
+    await arquivo.read(buffer, 0, buffer.length, inicio);
+    return (inicio > 0 ? "[...inicio omitido...]\n" : "") + buffer.toString("utf8");
+  } finally {
+    await arquivo.close();
+  }
+}
+
+app.get("/ambientes/:id/saida", async (req, res, next) => {
+  try {
+    let [ambiente] = await consultar("SELECT * FROM ambientes WHERE id = ?", [Number(req.params.id)]);
+    if (!ambiente) return avisar(res, "erro", "ambiente nao encontrado");
+    if (ambiente.estado === "em_execucao") ambiente = await atualizarEstado(ambiente);
+    let texto;
+    try {
+      texto = await lerFinal(ambiente.saida);
+    } catch (erro) {
+      texto = `nao foi possivel ler a saida: ${erro.message}`;
+    }
+    res.send(pagina(`Saida de ${ambiente.nome}`, `<h2>Saida de ${esc(ambiente.nome)}</h2>
+      <p>Estado: ${ESTADOS[ambiente.estado]} | <a href="/ambientes/${ambiente.id}/saida">Atualizar</a> | <a href="/">Voltar</a></p>
+      <pre>${esc(texto) || "(sem saida ainda)"}</pre>`));
   } catch (erro) { next(erro); }
 });
 

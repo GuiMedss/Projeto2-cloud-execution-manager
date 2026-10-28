@@ -42,6 +42,37 @@ cat > /var/www/html/index.html <<'HTML'
 </html>
 HTML
 
+# instala o node 20 para a aplicacao web
+if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 18 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+
+# usuario sem login que executa a aplicacao web
+id cloudapp >/dev/null 2>&1 || useradd --system --home-dir "$PASTA_PROJETO" --shell /usr/sbin/nologin cloudapp
+
+# instala as dependencias da aplicacao
+(cd "$PASTA_PROJETO/app" && npm ci --omit=dev --no-audit --no-fund)
+
+# servico systemd da aplicacao web
+cat > /etc/systemd/system/cloud-app.service <<'UNIT'
+[Unit]
+Description=cloud execution manager (aplicacao web)
+After=network.target mysql.service
+
+[Service]
+User=cloudapp
+WorkingDirectory=/opt/cloud-execution-manager/app
+ExecStart=/usr/bin/node servidor.js
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable cloud-app
+systemctl restart cloud-app
+
 systemctl enable --now apache2 mysql
 
-echo "provisionamento concluido. acesse http://localhost:8080"
+echo "provisionamento concluido. acesse http://localhost:3000"

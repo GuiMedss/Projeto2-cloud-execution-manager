@@ -5,6 +5,9 @@ Vagrant.configure("2") do |config|
   # permite acessar o apache pelo navegador do computador
   config.vm.network "forwarded_port", guest: 80, host: 8080, host_ip: "127.0.0.1"
 
+  # porta da aplicacao web
+  config.vm.network "forwarded_port", guest: 3000, host: 3000, host_ip: "127.0.0.1"
+
   # o codigo sera baixado pelo git dentro da vm
   config.vm.synced_folder ".", "/vagrant", disabled: true
 

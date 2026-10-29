@@ -2,13 +2,13 @@
 
 Projeto de Computacao em Nuvem para gerenciar ambientes de execucao pela web, usando namespaces e cgroups.
 
-O projeto conta com o provisionamento da VM, a criacao de ambientes com namespaces e limites de CPU, memoria e I/O e a aplicacao web com banco MySQL, upload de scripts e controle dos ambientes. A execucao dos programas enviados pelo usuario esta em desenvolvimento.
+O projeto permite criar ambientes com namespaces e limites de CPU, memoria e I/O, executar programas e scripts, consultar a saida e controlar as execucoes. A aplicacao web usa MySQL para os registros e permite enviar scripts para reutilizacao.
 
 ## Arquivos
 
 - `Vagrantfile`: define a VM, os recursos e a porta de acesso.
 - `provision.sh`: instala os pacotes, clona o repositorio e inicia os servicos.
-- `ambientes.py`: cria ambientes isolados e aplica os limites de recursos.
+- `ambientes.py`: cria ambientes, executa programas e controla status, saida e encerramento.
 - `app/`: aplicacao web em Node.js (`servidor.js`, `banco.js`, `execucao.js`, `schema.sql`).
 - `.gitattributes`: mantem os scripts com finais de linha compativeis com Linux, mesmo no Windows.
 - `.gitignore`: impede que os arquivos locais do Vagrant sejam enviados ao GitHub.
@@ -18,7 +18,7 @@ O projeto conta com o provisionamento da VM, a criacao de ambientes com namespac
 - Ubuntu 22.04, com VirtualBox.
 - 1 CPU e 4096 MB de memoria.
 - Apache como servidor web.
-- MySQL para o armazenamento permanente da aplicacao nas proximas etapas.
+- MySQL para o armazenamento permanente dos registros da aplicacao.
 - Git para baixar o codigo durante o provisionamento.
 - Python 3 para executar scripts Python.
 - Ferramentas `unshare` e `nsenter`, do pacote `util-linux`, para trabalhar com namespaces.
@@ -83,7 +83,7 @@ Resultados esperados:
 - A lista de controladores inclui `cpu`, `memory` e `io`.
 - O comando `unshare` e o MySQL mostram suas versoes.
 
-O MySQL ainda nao tem o banco nem o usuario da aplicacao. Nesta etapa, o acesso de verificacao usa `sudo mysql` dentro da VM.
+O provisionamento cria o banco e o usuario da aplicacao. O acesso de verificacao usa `sudo mysql` dentro da VM.
 
 Para sair da VM, execute `exit`.
 
@@ -117,11 +117,11 @@ Com a VM atualizada pelo `vagrant provision`, entre com `vagrant ssh` e execute:
 
 ```bash
 cd /opt/cloud-execution-manager
-sudo python3 ambientes.py exemplo --cpu 50 --memoria 128 --io 5
-sudo python3 ambientes.py outro --cpu 25 --memoria 64 --io 2
+sudo python3 ambientes.py criar exemplo --cpu 50 --memoria 128 --io 5
+sudo python3 ambientes.py criar outro --cpu 25 --memoria 64 --io 2
 ```
 
-Os dois ambientes ficam ativos simultaneamente. O comando retorna um JSON com o nome, a unidade do systemd, a pasta de trabalho, o caminho do cgroup e os limites escolhidos.
+Os dois ambientes ficam ativos simultaneamente, aguardando um programa. O comando retorna um JSON com os dados do ambiente e seu status. O formato anterior, sem a palavra `criar`, continua funcionando.
 
 Unidades e valores aceitos:
 
@@ -140,7 +140,7 @@ O systemd, ja instalado no Ubuntu, cria o cgroup de cada ambiente. `CPUQuota` de
 
 As opcoes usadas estao descritas nos manuais de [unshare](https://man7.org/linux/man-pages/man1/unshare.1.html) e [controle de recursos do systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html).
 
-Um processo Python em espera mantem cada ambiente vivo, trata o sinal de encerramento e recolhe processos filhos que terminarem. O processo interno avisa ao systemd quando os namespaces e o hostname estao prontos. A execucao dos programas sera acrescentada na proxima etapa. Estes ambientes sao temporarios e nao sao recriados automaticamente ao reiniciar a VM; as pastas no disco permanecem.
+Um processo Python com PID 1 mantem cada ambiente vivo e aguarda um pedido de execucao. Ele inicia o programa dentro dos namespaces e do cgroup que ja foram criados, espera o programa terminar e salva o resultado. Quando a execucao termina, os namespaces sao liberados e os arquivos de controle e saida continuam no disco. Os ambientes nao sao reiniciados automaticamente com a VM.
 
 ### Conferir namespaces e cgroups
 
@@ -180,14 +180,110 @@ Para verificar as validacoes, repita a criacao de `exemplo`, use `--cpu 0` ou um
 Para encerrar os ambientes de teste:
 
 ```bash
-sudo systemctl stop cloud-ambiente-exemplo.service cloud-ambiente-outro.service
+sudo python3 ambientes.py encerrar exemplo
+sudo python3 ambientes.py remover outro
 ```
 
-As pastas de trabalho ficam preservadas. A consulta de status e os comandos de encerramento e remocao pela aplicacao serao feitos nas proximas etapas.
+O encerramento preserva os arquivos para consulta. A remocao encerra os processos e apaga a pasta do ambiente, incluindo sua saida.
+
+## Executar programas e consultar resultados
+
+Dentro da VM, na pasta `/opt/cloud-execution-manager`:
+
+```bash
+sudo python3 ambientes.py criar tarefa --cpu 50 --memoria 128 --io 5
+sudo python3 ambientes.py executar tarefa -- python3 -c "print('ola, mundo')"
+sudo python3 ambientes.py status tarefa
+sudo python3 ambientes.py saida tarefa
+sudo python3 ambientes.py listar
+```
+
+A execucao ocorre em segundo plano. O envio do comando retorna sem esperar o programa terminar. Repita a consulta de status se a primeira resposta ainda indicar `em execucao`. O programa nao recebe entrada interativa pelo terminal.
+
+Estados retornados no campo `status`:
+
+| Status | Significado |
+| --- | --- |
+| `em execucao` | Ambiente ativo, aguardando um comando ou executando o programa |
+| `terminado` | Programa concluido com codigo zero ou ambiente encerrado manualmente |
+| `erro` | Programa falhou, nao pode ser iniciado ou o ambiente foi interrompido |
+
+O campo `comando` fica nulo enquanto o ambiente aguarda um programa. `codigo_retorno` registra o codigo do processo quando disponivel. Em encerramentos manuais sem resultado do programa, `encerrado` fica verdadeiro e `codigo_retorno` permanece nulo.
+
+Cada ambiente aceita uma execucao. Para executar novamente, crie outro ambiente ou remova o anterior antes de reutilizar o nome. Um comando pode iniciar varios programas, que herdam os mesmos limites. Exemplo com dois comandos em sequencia:
+
+```bash
+sudo python3 ambientes.py criar sequencia --cpu 50 --memoria 128 --io 5
+sudo python3 ambientes.py executar sequencia -- bash -c 'hostname && echo concluido'
+```
+
+### Scripts e servicos
+
+Um script salvo na VM pode ser executado pelo interpretador correspondente. A criacao e o envio pelo formulario pertencem a aplicacao web; o gerenciador recebe o caminho do arquivo:
+
+```bash
+sudo python3 ambientes.py criar script --cpu 50 --memoria 128 --io 5
+sudo python3 ambientes.py executar script -- python3 /caminho/do/script.py
+```
+
+Para verificar uma execucao continua:
+
+```bash
+sudo python3 ambientes.py criar servico --cpu 25 --memoria 64 --io 2
+sudo python3 ambientes.py executar servico -- bash -c 'while true; do echo "servico ativo"; sleep 2; done'
+sudo python3 ambientes.py status servico
+sudo python3 ambientes.py saida servico
+sudo python3 ambientes.py encerrar servico
+sudo python3 ambientes.py saida servico
+sudo python3 ambientes.py remover servico
+```
+
+Servicos devem permanecer em primeiro plano dentro do ambiente. Quando o programa principal termina, os processos restantes sao encerrados junto com o ambiente. O encerramento manual tambem atinge os processos filhos; se necessario, o systemd forca a parada depois de dois segundos.
+
+### Arquivos e erros
+
+A pasta `/var/lib/cloud-execution-manager/NOME` guarda:
+
+- `ambiente.json`: nome e configuracao do ambiente.
+- `comando.json`: programa e argumentos solicitados.
+- `resultado.json`: resultado da execucao, quando registrado.
+- `saida.log`: saida padrao e erros, no mesmo arquivo.
+- `encerrado`: marca de encerramento manual, quando nao ha resultado do programa.
+
+Esses registros sao usados pelo controle de execucao e nao substituem as tabelas MySQL da aplicacao web. Os arquivos permanecem apos desligar a VM. Uma execucao interrompida sem resultado registrado aparece como `erro` ao consultar novamente.
+
+O comando `saida` retorna o conteudo atual de `saida.log` em JSON, inclusive com o programa em execucao. Programas Python recebem `PYTHONUNBUFFERED=1` para disponibilizar as mensagens sem esperar o buffer encher. Outros programas podem precisar de sua propria opcao de saida sem buffer.
+
+Exemplo de erro com codigo de retorno conhecido:
+
+```bash
+sudo python3 ambientes.py criar falha --cpu 50 --memoria 128 --io 5
+sudo python3 ambientes.py executar falha -- bash -c 'echo erro-de-teste >&2; exit 3'
+sudo python3 ambientes.py status falha
+sudo python3 ambientes.py saida falha
+```
+
+Ao concluir, o status deve ser `erro`, o codigo deve ser `3` e a mensagem deve aparecer na saida. Os arquivos podem ser consultados ate a remocao do ambiente. Scripts reutilizaveis devem ficar fora das pastas dos ambientes para serem preservados ao remover uma execucao.
 
 ### Integracao com a aplicacao web
 
-A funcao `criar_ambiente(nome, cpu, memoria, io)` concentra a criacao e retorna um dicionario. A aplicacao tambem podera chamar a linha de comando com uma lista de argumentos e interpretar o JSON retornado. Os numeros devem ser inteiros, nas unidades da tabela; os campos de retorno sao `nome`, `unidade`, `pasta`, `cgroup`, `cpu`, `memoria` e `io`.
+As funcoes disponiveis em `ambientes.py` sao:
+
+| Funcao | Uso |
+| --- | --- |
+| `criar_ambiente(nome, cpu, memoria, io)` | Cria um ambiente e retorna seus dados |
+| `executar_programa(nome, comando)` | Recebe uma lista com o programa e seus argumentos |
+| `consultar_ambiente(nome)` | Retorna os dados e o status atual |
+| `listar_ambientes()` | Retorna uma lista com os ambientes registrados |
+| `ler_saida(nome)` | Retorna nome e conteudo da saida |
+| `encerrar_ambiente(nome)` | Encerra a execucao e preserva os arquivos |
+| `remover_ambiente(nome)` | Encerra e apaga os dados do ambiente |
+
+A aplicacao pode importar as funcoes em Python ou chamar a linha de comando com uma lista de argumentos e interpretar o JSON de resposta. O comando `executar` recebe os argumentos depois de `--`, sem montar uma string para o shell. Para usar operadores como `&&`, e necessario chamar `bash -c` explicitamente.
+
+Os dados do ambiente incluem `nome`, `unidade`, `pasta`, `cgroup`, `cpu`, `memoria`, `io`, `comando`, `status`, `codigo_retorno`, `erro` e `encerrado`. Um erro na chamada do gerenciador e informado em `stderr`, com codigo de saida 1. O codigo de retorno do programa executado aparece no JSON de status, pois a execucao e assincrona.
+
+Para a interface web, a resposta tambem inclui `estado` (com `em_execucao` no lugar de `em execucao`), `mensagem` e `saida` (caminho do arquivo de log). O subcomando `saida` continua retornando o conteudo do arquivo. A criacao aceita `--comando=TEXTO` ou `--script=CAMINHO` para criar e executar em uma chamada.
 
 A criacao de ambientes requer `sudo` dentro da VM. A aplicacao web chama o script pelo usuario `cloudapp`, que tem permissao de sudo apenas para o `ambientes.py` (veja a secao Aplicacao web). O Apache nao possui acesso geral de sudo.
 

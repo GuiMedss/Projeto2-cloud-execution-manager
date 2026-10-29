@@ -128,7 +128,9 @@ def criar_ambiente(nome, cpu, memoria, io):
         resultado = subprocess.run(comando, capture_output=True, text=True)
         if resultado.returncode != 0:
             erro = "nao foi possivel criar o ambiente: " + resultado.stderr.strip()
-            salvar_json(pasta / "resultado.json", {"status": "erro", "erro": erro})
+            # desfaz uma criacao que falhou para permitir outra tentativa
+            parar_servico(unidade)
+            shutil.rmtree(pasta)
             raise ValueError(erro)
         return consultar_registro(nome)
 
@@ -227,7 +229,13 @@ def manter_ambiente(nome):
                 comando, stdin=subprocess.DEVNULL, stdout=saida, stderr=subprocess.STDOUT,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
-            codigo = programa.wait()
+            # o pid 1 tambem recolhe filhos adotados enquanto o programa continua
+            while True:
+                pid, estado = os.waitpid(-1, 0)
+                if pid == programa.pid:
+                    codigo = os.waitstatus_to_exitcode(estado)
+                    programa.returncode = codigo
+                    break
             resultado = {"status": "terminado" if codigo == 0 else "erro", "codigo_retorno": codigo}
             if codigo != 0:
                 resultado["erro"] = f"o programa terminou com codigo {codigo}"

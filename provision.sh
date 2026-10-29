@@ -8,7 +8,7 @@ PASTA_PROJETO="/opt/cloud-execution-manager"
 
 # instala os servicos e as ferramentas usadas no projeto
 apt-get update
-apt-get install -y apache2 mysql-server git curl python3 util-linux
+apt-get install -y apache2 mysql-server git curl python3 util-linux openssl
 
 # baixa o codigo e permite atualizar ao repetir o provisionamento
 if [ -d "$PASTA_PROJETO/.git" ]; then
@@ -25,22 +25,6 @@ fi
 
 # prepara a pasta de trabalho dos ambientes no disco da vm
 mkdir -p /var/lib/cloud-execution-manager
-
-# esta pagina serve para conferir o acesso ao servidor web
-cat > /var/www/html/index.html <<'HTML'
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8">
-  <title>Cloud Execution Manager</title>
-</head>
-<body>
-  <h1>Cloud Execution Manager</h1>
-  <p>A VM e o Apache estao funcionando.</p>
-  <p>A interface de gerenciamento sera adicionada nas proximas etapas.</p>
-</body>
-</html>
-HTML
 
 # instala o node 20 para a aplicacao web
 if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 18 ]; then
@@ -98,6 +82,19 @@ systemctl daemon-reload
 systemctl enable cloud-app
 systemctl restart cloud-app
 
+# o apache recebe os acessos e encaminha para a aplicacao node
+a2enmod proxy proxy_http
+cat > /etc/apache2/sites-available/000-default.conf <<'APACHE'
+<VirtualHost *:80>
+    ServerName localhost
+    ProxyRequests Off
+    ProxyPreserveHost On
+    ProxyPass / http://127.0.0.1:3000/ retry=0
+    ProxyPassReverse / http://127.0.0.1:3000/
+</VirtualHost>
+APACHE
+apache2ctl configtest
 systemctl enable --now apache2 mysql
+systemctl restart apache2
 
-echo "provisionamento concluido. acesse http://localhost:3000"
+echo "provisionamento concluido. acesse http://localhost:8080"

@@ -143,11 +143,13 @@ app.post("/ambientes", async (req, res, next) => {
       if (existente) erros.push("ja existe um ambiente com esse nome");
     }
     if (!erros.length) {
+      let criado = false;
       try {
         const r = await execucao.criar({
           nome: dados.nome, cpu: dados.cpu, memoria: dados.memoria, io: dados.io,
           script: script && script.caminho, comando: dados.comando,
         });
+        criado = true;
         await consultar(
           `INSERT INTO ambientes (nome, cpu, memoria, io, script_id, comando, estado, unidade, pasta, cgroup, saida)
            VALUES (?, ?, ?, ?, ?, ?, 'em_execucao', ?, ?, ?, ?)`,
@@ -155,6 +157,11 @@ app.post("/ambientes", async (req, res, next) => {
             r.unidade, r.pasta, r.cgroup, r.saida]);
         return res.redirect(`/?msg=${encodeURIComponent(`ambiente ${dados.nome} criado`)}`);
       } catch (erro) {
+        // se o cadastro falhar, nao deixa uma execucao sem registro no banco
+        if (criado) {
+          try { await execucao.remover(dados.nome); }
+          catch (limpeza) { erros.push(`nao foi possivel limpar o ambiente: ${limpeza.message}`); }
+        }
         erros.push(erro.message);
       }
     }
@@ -182,8 +189,8 @@ const avisar = (res, tipo, texto) => res.redirect(`/?${tipo}=${encodeURIComponen
 
 app.post("/atualizar", async (req, res, next) => {
   try {
-    const ativos = await consultar("SELECT * FROM ambientes WHERE estado = 'em_execucao'");
-    for (const ambiente of ativos) await atualizarEstado(ambiente);
+    const ambientes = await consultar("SELECT * FROM ambientes");
+    for (const ambiente of ambientes) await atualizarEstado(ambiente);
     avisar(res, "msg", "status atualizado");
   } catch (erro) { next(erro); }
 });
@@ -195,7 +202,7 @@ app.post("/ambientes/:id/encerrar", async (req, res, next) => {
     try {
       const r = await execucao.encerrar(ambiente.nome);
       const estado = ESTADOS[r.estado] ? r.estado : "terminado";
-      await consultar("UPDATE ambientes SET estado = ?, mensagem = NULL WHERE id = ?", [estado, ambiente.id]);
+      await consultar("UPDATE ambientes SET estado = ?, mensagem = ? WHERE id = ?", [estado, r.mensagem || null, ambiente.id]);
       avisar(res, "msg", `ambiente ${ambiente.nome} encerrado`);
     } catch (erro) {
       avisar(res, "erro", `nao foi possivel encerrar ${ambiente.nome}: ${erro.message}`);
@@ -235,7 +242,7 @@ app.get("/ambientes/:id/saida", async (req, res, next) => {
   try {
     let [ambiente] = await consultar("SELECT * FROM ambientes WHERE id = ?", [Number(req.params.id)]);
     if (!ambiente) return avisar(res, "erro", "ambiente nao encontrado");
-    if (ambiente.estado === "em_execucao") ambiente = await atualizarEstado(ambiente);
+    if (ambiente.estado !== "terminado") ambiente = await atualizarEstado(ambiente);
     let texto;
     try {
       texto = await lerFinal(ambiente.saida);
@@ -243,8 +250,17 @@ app.get("/ambientes/:id/saida", async (req, res, next) => {
       texto = `nao foi possivel ler a saida: ${erro.message}`;
     }
     res.send(pagina(`Saida de ${ambiente.nome}`, `<h2>Saida de ${esc(ambiente.nome)}</h2>
-      <p>Estado: ${ESTADOS[ambiente.estado]} | <a href="/ambientes/${ambiente.id}/saida">Atualizar</a> | <a href="/">Voltar</a></p>
+      <p>Estado: ${ESTADOS[ambiente.estado]} | <a href="/ambientes/${ambiente.id}/saida">Atualizar</a> | <a href="/ambientes/${ambiente.id}/saida/arquivo">Baixar saida completa</a> | <a href="/">Voltar</a></p>
       <pre>${esc(texto) || "(sem saida ainda)"}</pre>`));
+  } catch (erro) { next(erro); }
+});
+
+// permite consultar o arquivo inteiro quando a saida ultrapassa o limite da tela
+app.get("/ambientes/:id/saida/arquivo", async (req, res, next) => {
+  try {
+    const [ambiente] = await consultar("SELECT * FROM ambientes WHERE id = ?", [Number(req.params.id)]);
+    if (!ambiente) return avisar(res, "erro", "ambiente nao encontrado");
+    res.download(ambiente.saida, `${ambiente.nome}.log`);
   } catch (erro) { next(erro); }
 });
 
@@ -298,6 +314,13 @@ app.post("/scripts", (req, res, next) => {
       }
       const nome = path.basename(req.file.originalname).slice(0, 100);
       try {
+        // ajusta os scripts bash salvos no windows antes de guardar o registro
+        if (path.extname(req.file.path).toLowerCase() === ".sh") {
+          const texto = await fs.promises.readFile(req.file.path, "utf8");
+          const ajustado = texto.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+          await fs.promises.writeFile(req.file.path, ajustado, "utf8");
+          req.file.size = Buffer.byteLength(ajustado, "utf8");
+        }
         await consultar("INSERT INTO scripts (nome, caminho, tamanho) VALUES (?, ?, ?)",
           [nome, req.file.path, req.file.size]);
       } catch (erro) {
@@ -311,6 +334,7 @@ app.post("/scripts", (req, res, next) => {
 
 app.use((erro, req, res, next) => {
   console.error(erro);
+  if (res.headersSent) return next(erro);
   res.status(500).send(pagina("Erro", `<p class="erro">erro interno: ${esc(erro.message)}</p>`));
 });
 
